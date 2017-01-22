@@ -1,13 +1,30 @@
 package com.androidfung.androidthings.helloworld;
 
+import android.animation.Animator;
+import android.animation.AnimatorListenerAdapter;
+import android.animation.ValueAnimator;
 import android.app.Activity;
+import android.graphics.Color;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
 import android.os.Bundle;
+import android.os.Handler;
 import android.util.Log;
+import android.view.KeyEvent;
+import android.view.animation.LinearInterpolator;
 
+import com.androidfung.helloworld.R;
+import com.google.android.things.contrib.driver.apa102.Apa102;
 import com.google.android.things.contrib.driver.bmx280.Bmx280;
+import com.google.android.things.contrib.driver.bmx280.Bmx280SensorDriver;
 import com.google.android.things.contrib.driver.button.Button;
+import com.google.android.things.contrib.driver.button.ButtonInputDriver;
 import com.google.android.things.contrib.driver.ht16k33.AlphanumericDisplay;
 import com.google.android.things.contrib.driver.ht16k33.Ht16k33;
+import com.google.android.things.contrib.driver.pwmspeaker.Speaker;
+import com.google.android.things.pio.Gpio;
 import com.google.android.things.pio.PeripheralManagerService;
 
 import com.google.android.things.contrib.driver.rainbowhat.RainbowHat;
@@ -23,37 +40,125 @@ import java.util.List;
 public class MainActivity extends Activity {
 
     private static final String TAG = MainActivity.class.getSimpleName();
-    private AlphanumericDisplay mSegment ;
-    private Bmx280 mSensor;
+
     private FirebaseDatabase mFirebaseDatabase;
     private DatabaseReference mRefMessage;
     private DatabaseReference mRefTemperature;
     private DatabaseReference mRefPressure;
+
+    private SensorManager mSensorManager;
+    private ButtonInputDriver mButtonInputDriver;
+    private Bmx280SensorDriver mEnvironmentalSensorDriver;
+    private AlphanumericDisplay mDisplay ;
+    private Bmx280 mSensor;
+    private Apa102 mLedstrip;
+    private int[] mRainbow = new int[7];
+
+
+    private Gpio mLed;
+    private Speaker mSpeaker;
     private Button mButtonA;
+
+    private static final int LEDSTRIP_BRIGHTNESS = 1;
+    private static final int SPEAKER_READY_DELAY_MS = 300;
+    private static final float BAROMETER_RANGE_LOW = 965.f;
+    private static final float BAROMETER_RANGE_HIGH = 1035.f;
+
+    private String mMessage;
+    private float mLastTemperature;
+    private float mLastPressure;
+    private boolean mShowMessage;
+
+    // Callback used when we register the BMP280 sensor driver with the system's SensorManager.
+    private SensorManager.DynamicSensorCallback mDynamicSensorCallback
+            = new SensorManager.DynamicSensorCallback() {
+        @Override
+        public void onDynamicSensorConnected(Sensor sensor) {
+            if (sensor.getType() == Sensor.TYPE_AMBIENT_TEMPERATURE) {
+                // Our sensor is connected. Start receiving temperature data.
+                mSensorManager.registerListener(mTemperatureListener, sensor,
+                        SensorManager.SENSOR_DELAY_NORMAL);
+            } else if (sensor.getType() == Sensor.TYPE_PRESSURE) {
+                // Our sensor is connected. Start receiving pressure data.
+                mSensorManager.registerListener(mPressureListener, sensor,
+                        SensorManager.SENSOR_DELAY_NORMAL);
+            }
+        }
+
+        @Override
+        public void onDynamicSensorDisconnected(Sensor sensor) {
+            super.onDynamicSensorDisconnected(sensor);
+        }
+    };
+
+    // Callback when SensorManager delivers temperature data.
+    private SensorEventListener mTemperatureListener = new SensorEventListener() {
+        @Override
+        public void onSensorChanged(SensorEvent event) {
+            mLastTemperature = event.values[0];
+            mRefTemperature.setValue(mLastTemperature);
+            try {
+                if (!mShowMessage) {
+                    mDisplay.display(mLastTemperature);
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+            Log.d(TAG, "sensor changed: " + mLastTemperature);
+        }
+
+        @Override
+        public void onAccuracyChanged(Sensor sensor, int accuracy) {
+            Log.d(TAG, "accuracy changed: " + accuracy);
+        }
+    };
+
+    // Callback when SensorManager delivers pressure data.
+    private SensorEventListener mPressureListener = new SensorEventListener() {
+        @Override
+        public void onSensorChanged(SensorEvent event) {
+            mLastPressure = event.values[0];
+            mRefPressure.setValue(mLastPressure);
+            updateBarometer(mLastPressure);
+            Log.d(TAG, "sensor changed: " + mLastPressure);
+        }
+
+        @Override
+        public void onAccuracyChanged(Sensor sensor, int accuracy) {
+            Log.d(TAG, "accuracy changed: " + accuracy);
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-//        setContentView(R.layout.activity_main);
+        setContentView(R.layout.activity_main);
 
-        PeripheralManagerService manager = new PeripheralManagerService();
-        List<String> portList = manager.getGpioList();
-        if (portList.isEmpty()) {
-            Log.i(TAG, "No GPIO port available on this device.");
-        } else {
-            Log.i(TAG, "List of available ports: " + portList);
-        }
+        mSensorManager = ((SensorManager) getSystemService(SENSOR_SERVICE));
 
+        //setup sensor
         try {
-            mSegment = RainbowHat.openDisplay();
-            mSegment.setBrightness(Ht16k33.HT16K33_BRIGHTNESS_MAX);
-            mSensor = RainbowHat.openSensor();
-            mSensor.setTemperatureOversampling(Bmx280.OVERSAMPLING_1X);
-            mSensor.setPressureOversampling(Bmx280.OVERSAMPLING_1X);
+            mEnvironmentalSensorDriver = RainbowHat.createSensorDriver();
+            mSensorManager.registerDynamicSensorCallback(mDynamicSensorCallback);
+            mEnvironmentalSensorDriver.registerTemperatureSensor();
+            mEnvironmentalSensorDriver.registerPressureSensor();
         }catch (IOException e){
-            e.printStackTrace();
+            throw new RuntimeException("Error initializing BMP280", e);
         }
 
+        //setup display
+        try {
+            mDisplay = RainbowHat.openDisplay();
+            mDisplay.setBrightness(Ht16k33.HT16K33_BRIGHTNESS_MAX);
+            mDisplay.setEnabled(true);
+            mDisplay.clear();
+        }catch (IOException e){
+            Log.e(TAG, "Error initializing display", e);
+            Log.d(TAG, "Display disabled");
+            mDisplay = null;
+        }
+
+        //setup Firebase
         mFirebaseDatabase = FirebaseDatabase.getInstance();
         mRefMessage = mFirebaseDatabase.getReference("message");
         mRefTemperature = mFirebaseDatabase.getReference("temperature");
@@ -65,14 +170,9 @@ public class MainActivity extends Activity {
             public void onDataChange(DataSnapshot dataSnapshot) {
                 // This method is called once with the initial value and again
                 // whenever data at this location is updated.
-                String value = dataSnapshot.getValue(String.class);
-                Log.d(TAG, "Value is: " + value);
-                try {
-                    mSegment.display(value);
-                    mSegment.setEnabled(true);
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
+//                String value = dataSnapshot.getValue(String.class);
+                mMessage = dataSnapshot.getValue().toString();
+//                Log.d(TAG, "Value is: " + value);
             }
 
             @Override
@@ -82,12 +182,71 @@ public class MainActivity extends Activity {
             }
         });
 
+        // SPI ledstrip
+        try {
+            mLedstrip = RainbowHat.openLedStrip();
+            mLedstrip.setBrightness(LEDSTRIP_BRIGHTNESS);
+            for (int i = 0; i < mRainbow.length; i++) {
+                float[] hsv = {i * 360.f / mRainbow.length, 1.0f, 1.0f};
+                mRainbow[i] = Color.HSVToColor(255, hsv);
+            }
+        } catch (IOException e) {
+            mLedstrip = null; // Led strip is optional.
+        }
+
+        // GPIO led
+        try {
+            mLed = RainbowHat.openLed(RainbowHat.LED_RED);
+            mLed.setEdgeTriggerType(Gpio.EDGE_NONE);
+            mLed.setDirection(Gpio.DIRECTION_OUT_INITIALLY_LOW);
+            mLed.setActiveType(Gpio.ACTIVE_HIGH);
+        } catch (IOException e) {
+            throw new RuntimeException("Error initializing led", e);
+        }
+
+        // PWM speaker
+        try {
+            mSpeaker = RainbowHat.openPiezo();
+            final ValueAnimator slide = ValueAnimator.ofFloat(440, 440 * 4);
+            slide.setDuration(50);
+            slide.setRepeatCount(5);
+            slide.setInterpolator(new LinearInterpolator());
+            slide.addUpdateListener(animation -> {
+                try {
+                    float v = (float) animation.getAnimatedValue();
+                    mSpeaker.play(v);
+                } catch (IOException e) {
+                    throw new RuntimeException("Error sliding speaker", e);
+                }
+            });
+            slide.addListener(new AnimatorListenerAdapter() {
+                @Override
+                public void onAnimationEnd(Animator animation) {
+                    try {
+                        mSpeaker.stop();
+                    } catch (IOException e) {
+                        throw new RuntimeException("Error sliding speaker", e);
+                    }
+                }
+            });
+            Handler handler = new Handler(getMainLooper());
+            handler.postDelayed(slide::start, SPEAKER_READY_DELAY_MS);
+        } catch (IOException e) {
+            throw new RuntimeException("Error initializing speaker", e);
+        }
+
         try {
             // Detect button press.
             mButtonA = RainbowHat.openButton(RainbowHat.BUTTON_A);
+
             mButtonA.setOnButtonEventListener((button, pressed) -> {
-                Log.d(TAG, "button A pressed:" + pressed);
-                updateRecord();
+                try {
+                    mShowMessage = pressed;
+                    mLed.setValue(pressed);
+                    mDisplay.display(mMessage);
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
             });
 
 
@@ -99,27 +258,87 @@ public class MainActivity extends Activity {
         Log.d(TAG, "Hello Android Things!");
     }
 
-    public void onPause(){
-        super.onPause();
-        try {
-            // Close the device when done.
-            mSegment.setEnabled(false);
-            mSegment.close();
-            mSensor.close();
-            mButtonA.close();
-        } catch (IOException e) {
-            e.printStackTrace();
+
+    @Override
+    protected void onDestroy(){
+        super.onDestroy();
+        // Clean up sensor registrations
+        mSensorManager.unregisterListener(mTemperatureListener);
+        mSensorManager.unregisterListener(mPressureListener);
+        mSensorManager.unregisterDynamicSensorCallback(mDynamicSensorCallback);
+
+        // Clean up peripheral.
+        if (mEnvironmentalSensorDriver != null) {
+            try {
+                mEnvironmentalSensorDriver.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+            mEnvironmentalSensorDriver = null;
         }
+        if (mButtonInputDriver != null) {
+            try {
+                mButtonInputDriver.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+            mButtonInputDriver = null;
+        }
+
+        if (mDisplay != null) {
+            try {
+                mDisplay.clear();
+                mDisplay.setEnabled(false);
+                mDisplay.close();
+            } catch (IOException e) {
+                Log.e(TAG, "Error disabling display", e);
+            } finally {
+                mDisplay = null;
+            }
+        }
+
+        if (mLedstrip != null) {
+            try {
+                mLedstrip.write(new int[7]);
+                mLedstrip.setBrightness(0);
+                mLedstrip.close();
+            } catch (IOException e) {
+                Log.e(TAG, "Error disabling ledstrip", e);
+            } finally {
+                mLedstrip = null;
+            }
+        }
+
+        if (mLed != null) {
+            try {
+                mLed.setValue(false);
+                mLed.close();
+            } catch (IOException e) {
+                Log.e(TAG, "Error disabling led", e);
+            } finally {
+                mLed = null;
+            }
+        }
+
     }
+    private void updateBarometer(float pressure) {
 
-
-    private void updateRecord(){
-        // Display the temperature on the segment display.
+        // Update led strip.
+        if (mLedstrip == null) {
+            return;
+        }
+        float t = (pressure - BAROMETER_RANGE_LOW) / (BAROMETER_RANGE_HIGH - BAROMETER_RANGE_LOW);
+        int n = (int) Math.ceil(mRainbow.length * t);
+        n = Math.max(0, Math.min(n, mRainbow.length));
+        int[] colors = new int[mRainbow.length];
+        for (int i = 0; i < n; i++) {
+            int ri = mRainbow.length - 1 - i;
+            colors[ri] = mRainbow[ri];
+        }
         try {
-            mRefTemperature.setValue(mSensor.readTemperature());
-            mRefPressure.setValue(mSensor.readPressure());
-        }catch (IOException e){
-            e.printStackTrace();
+            mLedstrip.write(colors);
+        } catch (IOException e) {
+            Log.e(TAG, "Error setting ledstrip", e);
         }
     }
 
